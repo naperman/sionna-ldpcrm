@@ -99,7 +99,8 @@ class LDPC5GEncoder(Block):
             raise ValueError(f"Unsupported coderate (r>0.95) for n={n}, k={k}.")
         if self._coderate<(1/5):
             # outer rep. coding currently not supported
-            raise ValueError("Unsupported coderate (r<1/5).")
+            #raise ValueError("Unsupported coderate (r<1/5).")
+            print(f"Warning: In LDPC5GEncoder::__init__, effective coderate r<1/5 for n={n}, k={k}. Error overriden")
 
         # construct the basegraph according to 38.212
         # if bg is explicitly provided
@@ -276,8 +277,9 @@ class LDPC5GEncoder(Block):
             Remark: Repetition coding is currently not supported.")
 
         if bg=="bg2" and r<1/5:
-            raise ValueError("Only coderate>1/5 supported for BG2. \
-            Remark: Repetition coding is currently not supported.")
+            #raise ValueError("Only coderate>1/5 supported for BG2. \
+            #Remark: Repetition coding is currently not supported.")
+            print(f"Warning: LDPC5GEncoder::_sel_basegraph, effective coderate r<1/5 for r={r}. Error overriden")
 
         return bg
 
