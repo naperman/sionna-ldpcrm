@@ -14,8 +14,9 @@ from sionna.phy import Block
 class LDPC5GEncoder(Block):
     # pylint: disable=line-too-long
     """5G NR LDPC Encoder following the 3GPP 38.212 including rate-matching.
-
-    The implementation follows the 3GPP NR Initiative [3GPPTS38212_LDPC]_.
+    
+    The implementation follows the 3GPP NR Initiative [3GPPTS38212_LDPC]_,
+    including rate-matching and circular buffer support for all redundancy versions.
 
     Parameters
     ----------
@@ -35,6 +36,10 @@ class LDPC5GEncoder(Block):
         If `None` is provided, the encoder will automatically select
         the basegraph according to [3GPPTS38212_LDPC]_.
 
+    rv: int
+        Redundancy version for rate matching (0, 1, 2, or 3). Defaults to 0.
+        Used to select the starting position in the circular buffer.
+        
     precision : `None` (default) | 'single' | 'double'
         Precision used for internal calculations and outputs.
         If set to `None`, :py:attr:`~sionna.phy.config.precision` is used.
@@ -57,21 +62,24 @@ class LDPC5GEncoder(Block):
     decoder needs to `invert` these operations, i.e., must be compatible with
     the 5G encoding scheme.
     """
-
     def __init__(self,
                  k,
                  n,
                  num_bits_per_symbol=None,
                  bg=None,
+                 rv=0,
                  precision=None,
                  **kwargs):
-
         super().__init__(precision=precision, **kwargs)
 
         if not isinstance(k, numbers.Number):
             raise TypeError("k must be a number.")
         if not isinstance(n, numbers.Number):
             raise TypeError("n must be a number.")
+        if not isinstance(rv, numbers.Number):
+            raise TypeError("n must be a number.")
+        assert rv in [0, 1, 2, 3], "rv must be 0, 1, 2, or 3."
+        
         k = int(k) # k or n can be float (e.g. as result of n=k*r)
         n = int(n) # k or n can be float (e.g. as result of n=k*r)
 
@@ -79,7 +87,6 @@ class LDPC5GEncoder(Block):
             raise ValueError("Unsupported code length (k too large).")
         if k<12:
             raise ValueError("Unsupported code length (k too small).")
-
         if n>(316*384):
             raise ValueError("Unsupported code length (n too large).")
         if n<0:
@@ -90,6 +97,8 @@ class LDPC5GEncoder(Block):
         self._n = n # the desired length (= output shape)
         self._coderate = k / n
         self._check_input = True # check input for consistency (i.e., binary)
+        self._rv = rv  # Redundancy version (0, 1, 2, or 3)
+        self._enable_circular_buffer = False
 
         # allow actual code rates slightly larger than 948/1024
         # to account for the quantization procedure in 38.214 5.1.3.1
@@ -98,25 +107,25 @@ class LDPC5GEncoder(Block):
         if self._coderate>(0.95): # as specified in 38.212 5.4.2.1
             raise ValueError(f"Unsupported coderate (r>0.95) for n={n}, k={k}.")
         if self._coderate<(1/5):
-            # outer rep. coding currently not supported
-            #raise ValueError("Unsupported coderate (r<1/5).")
-            print(f"Warning: In LDPC5GEncoder::__init__, effective coderate r<1/5 for n={n}, k={k}. Error overriden")
+            # outer rep. coding requires circular buffer
+            self._enable_circular_buffer = True
+            print("NOTE: effective coderate r<1/5 for n={n}, k={k}. Enabling circular buffer.")
+            #raise ValueError("Coderate < 1/5 requires enable_circular_buffer=True.")
 
         # construct the basegraph according to 38.212
         # if bg is explicitly provided
         self._bg = self._sel_basegraph(self._k, self._coderate, bg)
-
         self._z, self._i_ls, self._k_b = self._sel_lifting(self._k, self._bg)
         self._bm = self._load_basegraph(self._i_ls, self._bg)
 
         # total number of codeword bits
         self._n_ldpc = self._bm.shape[1] * self._z
+
         # if K_real < K _target puncturing must be applied earlier
         self._k_ldpc = self._k_b * self._z
 
         # construct explicit graph via lifting
         pcm = self._lift_basegraph(self._bm, self._z)
-
         pcm_a, pcm_b_inv, pcm_c1, pcm_c2 = self._gen_submat(self._bm,
                                                             self._k_b,
                                                             self._z,
@@ -134,8 +143,28 @@ class LDPC5GEncoder(Block):
 
         self._num_bits_per_symbol = num_bits_per_symbol
         if num_bits_per_symbol is not None:
-            self._out_int, self._out_int_inv  = self.generate_out_int(self._n,
-                                                    self._num_bits_per_symbol)
+            self._out_int, self._out_int_inv = self.generate_out_int(self._n,
+                                                                 self._num_bits_per_symbol)
+            
+        # Add compatibility metadata for the decoder
+        # These values are used by the decoder to properly handle pruning
+        # when circular buffer is enabled
+        # if self._enable_circular_buffer:
+        #     print("LDPC5GEncoder: circular buffer enabled and compatibility metadata added.")
+        #     # When circular buffer is enabled, we need to ensure compatibility
+        #     # with the decoder's pruning logic
+        #     self._original_n = n  # Store original n value
+            
+        #     # Calculate compatible virtual n_ldpc for decoder
+        #     # This ensures positive pruning values
+        #     k_filler = self._k_ldpc - self._k
+        #     virtual_n_ldpc = n + 2*self._z + ((self._n_ldpc - k_filler) - n - 2*self._z)
+            
+        #     # Ensure virtual_n_ldpc >= n_ldpc to avoid negative pruning values
+        #     self._virtual_n_ldpc = max(virtual_n_ldpc, self._n_ldpc)
+        # else:
+        #     self._original_n = n
+        #     self._virtual_n_ldpc = self._n_ldpc
 
     ###############################
     # Public methods and properties
@@ -166,6 +195,18 @@ class LDPC5GEncoder(Block):
         """Number of LDPC codeword bits before rate-matching"""
         return self._n_ldpc
 
+    # @property
+    # def n_ldpc(self):
+    #     """Number of LDPC codeword bits before rate-matching.
+        
+    #     When circular buffer is enabled, returns a compatible value for
+    #     the decoder to ensure proper pruning calculations.
+    #     """
+    #     if self._enable_circular_buffer:
+    #         return self._virtual_n_ldpc
+    #     else:
+    #         return self._n_ldpc
+
     @property
     def pcm(self):
         """Parity-check matrix for given code parameters"""
@@ -190,6 +231,18 @@ class LDPC5GEncoder(Block):
         """Inverse output interleaver sequence as defined in 5.4.2.2"""
         return self._out_int_inv
 
+    # Add property for rv
+    @property
+    def rv(self):
+        """Redundancy version for rate matching."""
+        return self._rv
+    
+    # Add property for circular buffer
+    @property
+    def enable_circular_buffer(self):
+        """Whether circular buffer is enabled for rate matching."""
+        return self._enable_circular_buffer
+    
     #################
     # Utility methods
     #################
@@ -592,6 +645,60 @@ class LDPC5GEncoder(Block):
         c = tf.expand_dims(c, axis=-1) # returns nx1 vector
         return c
 
+    # This is a new method to create the circular buffer
+    def _create_circular_buffer(self, c, batch_size):
+        """Creates the circular buffer for rate matching according to TS 38.212.
+        
+        This method implements the circular buffer as described in Section 5.4.2.1
+        to support multiple redundancy versions and code rates < 1/5.
+        """
+        # Get systematic and parity bits
+        systematic_bits = tf.slice(c, [0, 0], [batch_size, self._k_ldpc])
+        parity_bits = tf.slice(c, [0, self._k_ldpc], [batch_size, self._n_ldpc - self._k_ldpc])
+        
+        # Handle filler bit removal
+        if self._k < self._k_ldpc:
+            # Remove filler bits
+            systematic_part1 = tf.slice(systematic_bits, [0, 0], [batch_size, self._k])
+            systematic_no_filler = systematic_part1
+        else:
+            systematic_no_filler = systematic_bits
+            
+        # Construct circular buffer with systematic bits followed by parity bits
+        circular_buffer = tf.concat([systematic_no_filler, parity_bits], 1)
+        
+        return circular_buffer
+
+    # This is a new method to select bits from the circular buffer based on RV
+    def _select_from_circular_buffer(self, circular_buffer, batch_size):
+        """Selects bits from the circular buffer based on RV.
+        
+        This implements bit selection with different starting positions for
+        different redundancy versions (RV) as specified in TS 38.212 Section 5.4.2.1.
+        """
+        # Total available bits in the circular buffer
+        total_bits = tf.shape(circular_buffer)[1]
+        
+        # Calculate starting position based on RV parameter
+        # k₀ = (Z·K₀·RV)/2 as per TS 38.212 specification
+        K0 = 0
+        if self._bg == "bg1":
+            K0 = 22
+        else:  # bg2
+            K0 = 10
+            
+        k0 = tf.cast(tf.math.floor((self._z * K0 * self._rv) / 2), tf.int32)
+        
+        # Create indices with proper wrapping for circular buffer
+        # For very low code rates (< 1/5), n may be larger than the bits in the
+        # circular buffer, so we use modulo to handle the wrapping
+        indices = tf.math.floormod(tf.range(k0, k0 + self._n), total_bits)
+        
+        # Extract bits from circular buffer
+        selected_bits = tf.gather(circular_buffer, indices, axis=1)
+        
+        return selected_bits
+    
     def build(self, input_shape):
         """"Build block."""
         # check if k and input shape match
@@ -601,7 +708,8 @@ class LDPC5GEncoder(Block):
     def call(self, bits):
         """5G LDPC encoding function including rate-matching.
 
-        This function returns the encoded codewords as specified by the 3GPP NR Initiative [3GPPTS38212_LDPC]_ including puncturing and shortening.
+        This function returns the encoded codewords as specified by the 3GPP NR Initiative [3GPPTS38212_LDPC]_ including puncturing, shortening
+        and rate matching.
 
         Args:
 
@@ -641,21 +749,29 @@ class LDPC5GEncoder(Block):
 
         # use optimized encoding based on tf.gather
         c = self._encode_fast(u_fill)
-
+        
         c = tf.reshape(c, [batch_size, self._n_ldpc]) # remove last dim
 
-        # remove filler bits at pos (k, k_ldpc)
-        c_no_filler1 = tf.slice(c, [0, 0], [batch_size, self._k])
-        c_no_filler2 = tf.slice(c,
-                               [0, self._k_ldpc],
-                               [batch_size, self._n_ldpc - self._k_ldpc])
+        # If circular buffer is enabled, use it for rate matching
+        if self._enable_circular_buffer:
+            # Create circular buffer
+            circular_buffer = self._create_circular_buffer(c, batch_size)
+            
+            # Select bits from circular buffer based on RV
+            c_short = self._select_from_circular_buffer(circular_buffer, batch_size)
+        else:
+            # Use original rate matching (no circular buffer)
+            # remove filler bits at pos (k, k_ldpc)
+            c_no_filler1 = tf.slice(c, [0, 0], [batch_size, self._k])
+            c_no_filler2 = tf.slice(c,
+                                   [0, self._k_ldpc],
+                                   [batch_size, self._n_ldpc - self._k_ldpc])
+            c_no_filler = tf.concat([c_no_filler1, c_no_filler2], 1)
 
-        c_no_filler = tf.concat([c_no_filler1, c_no_filler2], 1)
-
-        # shorten the first 2*Z positions and end after n bits
-        # (remaining parity bits can be used for HARQ)
-        c_short = tf.slice(c_no_filler, [0, 2*self._z], [batch_size, self.n])
-        # incremental redundancy could be generated by accessing the last bits
+            # shorten the first 2*Z positions and end after n bits
+            # (remaining parity bits can be used for HARQ)
+            c_short = tf.slice(c_no_filler, [0, 2*self._z], [batch_size, self.n])
+            # incremental redundancy could be generated by accessing the last bits
 
         # if num_bits_per_symbol is provided, apply output interleaver as
         # specified in Sec. 5.4.2.2 in 38.212
