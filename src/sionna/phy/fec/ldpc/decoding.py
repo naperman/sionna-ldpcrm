@@ -1172,7 +1172,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
 
     Inherits from :class:`~sionna.phy.fec.ldpc.decoding.LDPCBPDecoder` and
     provides a wrapper for 5G compatibility, i.e., automatically handles
-    rate-matching according to [3GPPTS38212_LDPC]_ with circular buffer support.
+    rate-matching according to [3GPPTS38212_LDPC]_.
 
     Note that for full 5G 3GPP NR compatibility, the correct puncturing and
     shortening patterns must be applied and, thus, the encoder object is
@@ -1342,7 +1342,7 @@ class LDPC5GDecoder(LDPCBPDecoder):
             raise TypeError('prune_pcm must be bool.')
         self._prune_pcm = prune_pcm
 	
-	# Check if circular buffer is enabled (added for circular buffer support)
+        # Check if circular buffer is enabled (added for circular buffer support)
         self._circular_buffer_enabled = False
         if hasattr(encoder, 'enable_circular_buffer'):
             self._circular_buffer_enabled = encoder.enable_circular_buffer
@@ -1421,6 +1421,173 @@ class LDPC5GDecoder(LDPCBPDecoder):
     def encoder(self):
         """LDPC Encoder used for rate-matching/recovery"""
         return self._encoder
+
+    #################
+    # Utility methods
+    #################
+    
+    def _call_circular_buffer(self, llr_ch, /, *, num_iter=None, msg_v2c=None):
+        """Specialized path for circular buffer decoding with soft combining.
+        
+        This handles LLRs from encoders that use circular buffer rate matching.
+        The decoder must reverse the exact circular buffer process used by the encoder
+        and perform soft combining (LLR addition) for repeated bit positions.
+        """
+        
+        # Get input shape and batch size
+        llr_ch_shape = llr_ch.get_shape().as_list()
+        new_shape = [-1, self.encoder.n]
+        llr_ch_reshaped = tf.reshape(llr_ch, new_shape)
+        batch_size = tf.shape(llr_ch_reshaped)[0]
+        
+        # Invert output interleaver if used
+        if self._encoder.num_bits_per_symbol is not None:
+            llr_ch_reshaped = tf.gather(llr_ch_reshaped,
+                                        self._encoder.out_int_inv,
+                                        axis=-1)
+        
+        # Initialize full LDPC codeword LLRs with zeros
+        llr_5g = tf.zeros([batch_size, self.encoder.n_ldpc], self.rdtype)
+        
+        # Calculate circular buffer size (after filler removal and puncturing)
+        k_filler = self.encoder.k_ldpc - self.encoder.k
+        N_cb = self.encoder.n_ldpc - k_filler - 2 * self.encoder.z
+        
+        # Calculate starting position k0 based on RV (same as encoder)
+        if self.encoder._bg == "bg1":
+            rv_coefficients = [0, 17, 33, 56]
+            denominator = 66
+        else:  # bg2
+            rv_coefficients = [0, 13, 25, 43]
+            denominator = 50
+        
+        # Calculate k0 based on RV (same logic as encoder)
+        if self.encoder.rv == 0:
+            k0 = 0
+        else:
+            k0 = tf.cast(tf.math.floor((rv_coefficients[self.encoder.rv] * N_cb) / (denominator * self.encoder.z)) * self.encoder.z, tf.int32)
+        
+        # Adjust k0 for filler bit positions (same logic as encoder)
+        if k0 < self.encoder.k - 2 * self.encoder.z:
+            # k0 is before filler bits, no adjustment needed
+            pass
+        elif (k0 >= self.encoder.k - 2 * self.encoder.z) and (k0 < self.encoder.k_ldpc - 2 * self.encoder.z):
+            # k0 falls within filler bits, adjust to last bit before filler
+            k0 = self.encoder.k - 2 * self.encoder.z - 1
+        elif k0 >= self.encoder.k_ldpc - 2 * self.encoder.z:
+            # k0 falls after filler bits, subtract number of filler bits
+            k0 = k0 - (self.encoder.k_ldpc - self.encoder.k)
+        
+        # Map received LLRs back to their original positions in the LDPC codeword
+        # This reverses the circular buffer selection process with soft combining
+        for i in range(self.encoder.n):
+            # Calculate position in circular buffer (after filler removal and puncturing)
+            cb_pos = (k0 + i) % N_cb
+            
+            # Map circular buffer position back to LDPC codeword position
+            if cb_pos < self.encoder.k - 2 * self.encoder.z:
+                # Position is in systematic part (after puncturing)
+                ldpc_pos = cb_pos + 2 * self.encoder.z
+            else:
+                # Position is in parity part (after systematic + filler bits)
+                ldpc_pos = cb_pos + 2 * self.encoder.z + k_filler
+            
+            # SOFT COMBINING: Add the received LLR to existing value at this position
+            # This implements chase combining for HARQ - when the same bit is repeated
+            # due to circular buffer wrapping, we add the LLRs for optimal combining
+            indices = tf.stack([tf.range(batch_size, dtype=tf.int32), 
+                                tf.ones(batch_size, dtype=tf.int32) * ldpc_pos], axis=1)
+            
+            # Use scatter_nd_add instead of scatter_nd_update for soft combining
+            llr_5g = tf.tensor_scatter_nd_add(
+                llr_5g, indices, llr_ch_reshaped[:, i])
+        
+        # Add strong LLRs for known positions
+        
+        # 1. Punctured positions (first 2*Z): Set to 0 (neutral)
+        # Note: We use update (not add) for these since they're initialization values
+        punctured_indices = tf.range(2 * self.encoder.z)
+        for pos in punctured_indices:
+            indices = tf.stack([tf.range(batch_size, dtype=tf.int32), 
+                                tf.ones(batch_size, dtype=tf.int32) * pos], axis=1)
+            llr_5g = tf.tensor_scatter_nd_update(
+                llr_5g, indices, tf.zeros(batch_size, self.rdtype))
+        
+        # 2. Filler bit positions: Set to strong zero (-llr_max)
+        # Note: We use update (not add) for these since they're known values
+        if k_filler > 0:
+            filler_start = self.encoder.k
+            filler_end = self.encoder.k_ldpc
+            for pos in range(filler_start, filler_end):
+                indices = tf.stack([tf.range(batch_size, dtype=tf.int32), 
+                                    tf.ones(batch_size, dtype=tf.int32) * pos], axis=1)
+                llr_5g = tf.tensor_scatter_nd_update(
+                    llr_5g, indices, 
+                    tf.ones(batch_size, self.rdtype) * (-self._llr_max))
+        
+        # Run the core BP decoder
+        output = super().call(llr_5g, num_iter=num_iter, msg_v2c=msg_v2c)
+        
+        # Process outputs
+        if self._return_state:
+            x_hat, msg_v2c_out = output
+        else:
+            x_hat = output
+            
+        if self._return_infobits:
+            # Return only info bits (systematic part)
+            u_hat = tf.slice(x_hat, [0, 0], [batch_size, self.encoder.k])
+            
+            # Reshape to match original input dimensions
+            output_shape = llr_ch_shape[0:-1] + [self.encoder.k]
+            output_shape[0] = -1
+            u_reshaped = tf.reshape(u_hat, output_shape)
+            
+            if self._return_state:
+                return u_reshaped, msg_v2c_out
+            else:
+                return u_reshaped
+        else:
+            # Return all codeword bits by reversing the exact encoding process
+            
+            # Remove filler bits (same as non-circular buffer path)
+            x_no_filler1 = tf.slice(x_hat, [0, 0], [batch_size, self.encoder.k])
+            x_no_filler2 = tf.slice(x_hat, [0, self.encoder.k_ldpc], 
+                                    [batch_size, self.encoder.n_ldpc - self.encoder.k_ldpc])
+            x_no_filler = tf.concat([x_no_filler1, x_no_filler2], 1)
+            
+            # Apply puncturing (remove first 2*Z positions)
+            x_after_puncturing = tf.slice(x_no_filler, [0, 2 * self.encoder.z], 
+                                            [batch_size, tf.shape(x_no_filler)[1] - 2 * self.encoder.z])
+            
+            # Apply the same circular buffer selection as the encoder
+            output_bits = tf.zeros([batch_size, self.encoder.n], self.rdtype)
+            
+            for i in range(self.encoder.n):
+                # Same circular buffer logic as encoder
+                cb_pos = (k0 + i) % N_cb
+                
+                # Extract bit from the punctured, filler-removed codeword
+                bit = tf.slice(x_after_puncturing, [0, cb_pos], [batch_size, 1])
+                
+                # Place in output
+                indices = tf.stack([tf.range(batch_size, dtype=tf.int32), 
+                                    tf.ones(batch_size, dtype=tf.int32) * i], axis=1)
+                output_bits = tf.tensor_scatter_nd_update(
+                    output_bits, indices, tf.squeeze(bit, axis=1))
+            
+            # Apply output interleaver if needed
+            if self._encoder.num_bits_per_symbol is not None:
+                output_bits = tf.gather(output_bits, self._encoder.out_int, axis=-1)
+                
+            # Reshape to match original input dimensions
+            llr_ch_shape[0] = -1
+            output_bits = tf.reshape(output_bits, llr_ch_shape)
+            
+            if self._return_state:
+                return output_bits, msg_v2c_out
+            else:
+                return output_bits
 
     ########################
     # Sionna block functions
@@ -1547,147 +1714,4 @@ class LDPC5GDecoder(LDPCBPDecoder):
             if self._return_state:
                 return x_short, msg_v2c
             else:
-                return x_short
-    
-    def _call_circular_buffer(self, llr_ch, /, *, num_iter=None, msg_v2c=None):
-        """Specialized path for circular buffer decoding.
-        
-        This handles LLRs from encoders that use circular buffer rate matching.
-        """
-        # Get input shape and batch size
-        llr_ch_shape = llr_ch.get_shape().as_list()
-        new_shape = [-1, self.encoder.n]
-        llr_ch_reshaped = tf.reshape(llr_ch, new_shape)
-        batch_size = tf.shape(llr_ch_reshaped)[0]
-        
-        # Invert output interleaver if used
-        if self._encoder.num_bits_per_symbol is not None:
-            llr_ch_reshaped = tf.gather(llr_ch_reshaped,
-                                       self._encoder.out_int_inv,
-                                       axis=-1)
-        
-        # For circular buffer decoding, we create a full codeword
-        # with the received LLRs at the correct positions and zeros elsewhere
-        
-        # Create a tensor of right size for LDPCBPDecoder
-        llr_5g = tf.zeros([batch_size, self.encoder.n_ldpc], self.rdtype)
-        
-        # Calculate starting position based on RV
-        if hasattr(self.encoder, 'rv'):
-            rv = self.encoder.rv
-        else:
-            rv = 0  # Default if not defined
-            
-        # Follow same formula as encoder to get starting position
-        K0 = 0
-        if self.encoder._bg == "bg1":
-            K0 = 22
-        else:  # bg2
-            K0 = 10
-            
-        k0 = int(np.floor((self.encoder.z * K0 * rv) / 2))
-        
-        # Place LLRs starting at correct position in the buffer
-        # We'll need to handle wrapping for consistency with encoder
-        
-        # Calculate the number of available positions
-        # For simplicity we'll use k_info + parity_bits with no filler
-        k_filler = self.encoder.k_ldpc - self.encoder.k
-        available_positions = self.encoder.k + (self.encoder.n_ldpc - self.encoder.k_ldpc)
-        
-        # For each position in the input LLRs
-        for i in range(self.encoder.n):
-            # Calculate the position in the circular buffer
-            pos = (k0 + i) % available_positions
-            
-            # Convert circular buffer position to codeword position
-            # If position is in the info part
-            if pos < self.encoder.k:
-                cw_pos = pos
-            else:
-                # If in the parity part, account for filler bits
-                cw_pos = pos + k_filler
-                
-            # Update the LLR at this position
-            llr_5g = tf.tensor_scatter_nd_update(
-                llr_5g,
-                tf.stack([tf.range(batch_size, dtype=tf.int32), 
-                          tf.ones(batch_size, dtype=tf.int32) * cw_pos], axis=1),
-                llr_ch_reshaped[:, i]
-            )
-        
-        # Add strong zeros for filler bits (LLR=-llr_max)
-        if k_filler > 0:
-            filler_pos = tf.range(self.encoder.k, self.encoder.k + k_filler)
-            filler_llrs = -tf.cast(self._llr_max, self.rdtype) * tf.ones([k_filler, batch_size], self.rdtype)
-            
-            # Update filler positions with strong zero LLRs
-            for i, pos in enumerate(filler_pos):
-                llr_5g = tf.tensor_scatter_nd_update(
-                    llr_5g,
-                    tf.stack([tf.range(batch_size, dtype=tf.int32), 
-                              tf.ones(batch_size, dtype=tf.int32) * pos], axis=1),
-                    tf.ones(batch_size, self.rdtype) * -self._llr_max
-                )
-        
-        # Run the standard decoder with our prepared LLRs
-        output = super().call(llr_5g, num_iter=num_iter, msg_v2c=msg_v2c)
-        
-        # Process outputs same as standard decoder
-        if self._return_state:
-            x_hat, msg_v2c = output
-        else:
-            x_hat = output
-            
-        if self._return_infobits:
-            # Return only info bits (systematic part)
-            u_hat = tf.slice(x_hat, [0,0], [batch_size, self.encoder.k])
-            
-            # Reshape to match original input dimensions
-            output_shape = llr_ch_shape[0:-1] + [self.encoder.k]
-            output_shape[0] = -1
-            u_reshaped = tf.reshape(u_hat, output_shape)
-            
-            if self._return_state:
-                return u_reshaped, msg_v2c
-            else:
-                return u_reshaped
-        else:
-            # Return all codeword bits - for circular buffer
-            # we just need to extract the same bit pattern as the encoder used
-            
-            # Get all bits through circular buffer pattern
-            n_decoded = self.encoder.n
-            decoded_bits = tf.zeros([batch_size, n_decoded], self.rdtype)
-            
-            # For each position in the output
-            for i in range(n_decoded):
-                # Calculate the position in the circular buffer
-                pos = (k0 + i) % available_positions
-                
-                # Convert circular buffer position to codeword position
-                if pos < self.encoder.k:
-                    cw_pos = pos
-                else:
-                    cw_pos = pos + k_filler
-                    
-                # Get the bit from the decoded codeword
-                bit = tf.slice(x_hat, [0, cw_pos], [batch_size, 1])
-                
-                # Update the output tensor
-                indices = tf.expand_dims(tf.range(batch_size), axis=1)
-                indices = tf.concat([indices, tf.ones_like(indices) * i], axis=1)
-                decoded_bits = tf.tensor_scatter_nd_update(decoded_bits, indices, tf.squeeze(bit, axis=1))
-            
-            # Apply output interleaver if needed
-            if self._encoder.num_bits_per_symbol is not None:
-                decoded_bits = tf.gather(decoded_bits, self._encoder.out_int, axis=-1)
-                
-            # Reshape to match original input dimensions
-            llr_ch_shape[0] = -1
-            decoded_bits = tf.reshape(decoded_bits, llr_ch_shape)
-            
-            if self._return_state:
-                return decoded_bits, msg_v2c
-            else:
-                return decoded_bits
+                return x_short    
