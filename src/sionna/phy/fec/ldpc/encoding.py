@@ -646,7 +646,7 @@ class LDPC5GEncoder(Block):
             k0 = tf.math.floormod(k0, N_cb)
 
         # k0 is indexed from after the end of the punctured bits (2*Z_c) to the end of the encoded bits, including the filler bits.
-        # But our circular buffer contains the codeword with filler bits removed and into addition to puncturing (shortening) the first 2*Z_c bits.
+        # But our circular buffer contains the codeword with filler bits removed and in addition to puncturing (shortening) the first 2*Z_c bits.
         # So, we need to adjust k0 based on which of the following 3 regions of the punctured(only) codeword it falls within.
         # 1) k0 is before the start of the filler bits, where no adjustment is needed.
         # 2) k0 falls within the filler bits, where we need to adjust it to point to the last bit before the filler.
