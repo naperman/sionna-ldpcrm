@@ -101,11 +101,12 @@ class LDPC5GEncoder(Block):
             print(f"Warning: effective coderate r>948/1024 for n={n}, k={k}.")
         if self._coderate > (0.95):  # as specified in 38.212 5.4.2.1
             raise ValueError(f"Unsupported coderate (r>0.95) for n={n}, k={k}.")
-        if self._coderate < (1 / 5):
-            # outer rep. coding requires circular buffer
+        if self._coderate < (1 / 5):  # as specified in 38.212 5.4.2.1
+            # allow actural code rates less than 1/5 by enabling repetition coding
+            # using circular buffer according to procedure in 38.212 5.4.2.1
+            print("Warning: effective coderate r<1/5 for n={n}, k={k}. Enabling repetition coding.")
             self._enable_circular_buffer = True
-            print("NOTE: effective coderate r<1/5 for n={n}, k={k}. Enabling circular buffer.")
-            # raise ValueError("Coderate < 1/5 requires enable_circular_buffer=True.")
+
 
         # construct the basegraph according to 38.212
         # if bg is explicitly provided
@@ -137,26 +138,6 @@ class LDPC5GEncoder(Block):
         if num_bits_per_symbol is not None:
             self._out_int, self._out_int_inv = self.generate_out_int(self._n, self._num_bits_per_symbol)
 
-        # Add compatibility metadata for the decoder
-        # These values are used by the decoder to properly handle pruning
-        # when circular buffer is enabled
-        # if self._enable_circular_buffer:
-        #     print("LDPC5GEncoder: circular buffer enabled and compatibility metadata added.")
-        #     # When circular buffer is enabled, we need to ensure compatibility
-        #     # with the decoder's pruning logic
-        #     self._original_n = n  # Store original n value
-
-        #     # Calculate compatible virtual n_ldpc for decoder
-        #     # This ensures positive pruning values
-        #     k_filler = self._k_ldpc - self._k
-        #     virtual_n_ldpc = n + 2*self._z + ((self._n_ldpc - k_filler) - n - 2*self._z)
-
-        #     # Ensure virtual_n_ldpc >= n_ldpc to avoid negative pruning values
-        #     self._virtual_n_ldpc = max(virtual_n_ldpc, self._n_ldpc)
-        # else:
-        #     self._original_n = n
-        #     self._virtual_n_ldpc = self._n_ldpc
-
     ###############################
     # Public methods and properties
     ###############################
@@ -185,18 +166,6 @@ class LDPC5GEncoder(Block):
     def n_ldpc(self):
         """Number of LDPC codeword bits before rate-matching"""
         return self._n_ldpc
-
-    # @property
-    # def n_ldpc(self):
-    #     """Number of LDPC codeword bits before rate-matching.
-
-    #     When circular buffer is enabled, returns a compatible value for
-    #     the decoder to ensure proper pruning calculations.
-    #     """
-    #     if self._enable_circular_buffer:
-    #         return self._virtual_n_ldpc
-    #     else:
-    #         return self._n_ldpc
 
     @property
     def pcm(self):
@@ -315,16 +284,6 @@ class LDPC5GEncoder(Block):
         if bg == "bg2" and k > 3840:
             raise ValueError(f"K is not supported by BG2 (too large) k ={k}.")
 
-        if bg == "bg1" and r < 1 / 3:
-            raise ValueError(
-                "Only coderate>1/3 supported for BG1. \
-            Remark: Repetition coding is currently not supported."
-            )
-
-        if bg == "bg2" and r < 1 / 5:
-            # raise ValueError("Only coderate>1/5 supported for BG2. \
-            # Remark: Repetition coding is currently not supported.")
-            print(f"Warning: LDPC5GEncoder::_sel_basegraph, effective coderate r<1/5 for r={r}. Error overriden")
 
         return bg
 
@@ -647,7 +606,7 @@ class LDPC5GEncoder(Block):
         return circular_buffer
 
     # This is a new method to select bits from the circular buffer based on RV
-    def _select_from_circular_buffer(self, circular_buffer, batch_size):
+    def _select_from_circular_buffer(self, circular_buffer):
         """Selects bits from the circular buffer based on RV.
 
         This implements bit selection with different starting positions for
@@ -699,9 +658,8 @@ class LDPC5GEncoder(Block):
         elif k0 >= self._k_ldpc - 2 * self._z:
             k0 = k0 - (self._k_ldpc - self._k)
 
-        # Create indices with proper wrapping for circular buffer
-        # For very low code rates (< 1/5), n may be larger than the bits in the
-        # circular buffer, so we use modulo to handle the wrapping
+        # Create indices with proper wrapping for circular buffer. For very low code rates (i.e. r < 1/3 for bg1 and r < 1/5 for bg2),
+        # n may be larger than the bits in the circular buffer, so we use modulo to handle the wrapping
         indices = tf.math.floormod(tf.range(k0, k0 + self._n), N_cb)
 
         # Extract bits from circular buffer
@@ -782,7 +740,7 @@ class LDPC5GEncoder(Block):
             circular_buffer = self._create_circular_buffer(c_short)
 
             # Select bits from circular buffer based on RV with wrapping
-            c_short = self._select_from_circular_buffer(circular_buffer, batch_size)
+            c_short = self._select_from_circular_buffer(circular_buffer)
         else:
             # shorten the first 2*Z positions and end after n bits
             # (remaining parity bits can be used for HARQ)
