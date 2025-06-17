@@ -7,22 +7,21 @@ import tensorflow as tf
 import numpy as np
 import scipy as sp
 from importlib_resources import files, as_file
-from . import ldpc_basegraphs as codes  # pylint: disable=relative-beyond-top-level
-import numbers  # to check if n, k are numbers
+from . import codes # pylint: disable=relative-beyond-top-level
+import numbers # to check if n, k are numbers
 from sionna.phy import Block
-
 
 class LDPC5GEncoder(Block):
     # pylint: disable=line-too-long
     """5G NR LDPC Encoder following the 3GPP 38.212 including rate-matching.
 
-    The implementation follows the 3GPP NR Initiative [3GPPTS38212_LDPC]_,
+    The implementation follows the 3GPP NR Initiative [3GPPTS38212_LDPC]_.
     including rate-matching and circular buffer support for all redundancy versions.
 
     Parameters
     ----------
     k: int
-        Defining the number of information bit per codeword.
+        Defining the number of information bits per codeword.
 
     n: int
         Defining the desired codeword length.
@@ -64,7 +63,15 @@ class LDPC5GEncoder(Block):
     the 5G encoding scheme.
     """
 
-    def __init__(self, k, n, num_bits_per_symbol=None, bg=None, rv=0, precision=None, **kwargs):
+    def __init__(self,
+                 k,
+                 n,
+                 num_bits_per_symbol=None,
+                 bg=None,
+                 rv=0,
+                 precision=None,
+                 **kwargs):
+
         super().__init__(precision=precision, **kwargs)
 
         if not isinstance(k, numbers.Number):
@@ -78,18 +85,19 @@ class LDPC5GEncoder(Block):
         k = int(k)  # k or n can be float (e.g. as result of n=k*r)
         n = int(n)  # k or n can be float (e.g. as result of n=k*r)
 
-        if k > 8448:
+        if k>8448:
             raise ValueError("Unsupported code length (k too large).")
-        if k < 12:
+        if k<12:
             raise ValueError("Unsupported code length (k too small).")
-        if n > (316 * 384):
+
+        if n>(316*384):
             raise ValueError("Unsupported code length (n too large).")
-        if n < 0:
+        if n<0:
             raise ValueError("Unsupported code length (n negative).")
 
         # init encoder parameters
-        self._k = k  # number of input bits (= input shape)
-        self._n = n  # the desired length (= output shape)
+        self._k = k # number of input bits (= input shape)
+        self._n = n # the desired length (= output shape)
         self._coderate = k / n
         self._check_input = True  # check input for consistency (i.e., binary)
         self._rv = rv  # Redundancy version (0, 1, 2, or 3)
@@ -97,36 +105,37 @@ class LDPC5GEncoder(Block):
 
         # allow actual code rates slightly larger than 948/1024
         # to account for the quantization procedure in 38.214 5.1.3.1
-        if self._coderate > (948 / 1024):  # as specified in 38.212 5.4.2.1
+        if self._coderate>(948/1024): # as specified in 38.212 5.4.2.1
             print(f"Warning: effective coderate r>948/1024 for n={n}, k={k}.")
-        if self._coderate > (0.95):  # as specified in 38.212 5.4.2.1
+        if self._coderate>(0.95): # as specified in 38.212 5.4.2.1
             raise ValueError(f"Unsupported coderate (r>0.95) for n={n}, k={k}.")
-        if self._coderate < (1 / 5):  # as specified in 38.212 5.4.2.1
-            # allow actural code rates less than 1/5 by enabling repetition coding
-            # using circular buffer according to procedure in 38.212 5.4.2.1
-            print("Warning: effective coderate r<1/5 for n={n}, k={k}. Enabling repetition coding.")
+        if self._coderate<(1/5):
+            # outer rep. coding requires circular buffer
             self._enable_circular_buffer = True
-
 
         # construct the basegraph according to 38.212
         # if bg is explicitly provided
         self._bg = self._sel_basegraph(self._k, self._coderate, bg)
+
         self._z, self._i_ls, self._k_b = self._sel_lifting(self._k, self._bg)
         self._bm = self._load_basegraph(self._i_ls, self._bg)
 
         # total number of codeword bits
         self._n_ldpc = self._bm.shape[1] * self._z
-
         # if K_real < K _target puncturing must be applied earlier
         self._k_ldpc = self._k_b * self._z
 
         # construct explicit graph via lifting
         pcm = self._lift_basegraph(self._bm, self._z)
-        pcm_a, pcm_b_inv, pcm_c1, pcm_c2 = self._gen_submat(self._bm, self._k_b, self._z, self._bg)
+
+        pcm_a, pcm_b_inv, pcm_c1, pcm_c2 = self._gen_submat(self._bm,
+                                                            self._k_b,
+                                                            self._z,
+                                                            self._bg)
 
         # init sub-matrices for fast encoding ("RU"-method)
         # note: dtype is tf.float32;
-        self._pcm = pcm  # store the sparse parity-check matrix (for decoding)
+        self._pcm = pcm # store the sparse parity-check matrix (for decoding)
 
         # store indices for fast gathering (instead of explicit matmul)
         self._pcm_a_ind = self._mat_to_ind(pcm_a)
@@ -136,7 +145,8 @@ class LDPC5GEncoder(Block):
 
         self._num_bits_per_symbol = num_bits_per_symbol
         if num_bits_per_symbol is not None:
-            self._out_int, self._out_int_inv = self.generate_out_int(self._n, self._num_bits_per_symbol)
+            self._out_int, self._out_int_inv  = self.generate_out_int(self._n,
+                                                    self._num_bits_per_symbol)
 
     ###############################
     # Public methods and properties
@@ -186,13 +196,11 @@ class LDPC5GEncoder(Block):
     def out_int(self):
         """Output interleaver sequence as defined in 5.4.2.2"""
         return self._out_int
-
     @property
     def out_int_inv(self):
         """Inverse output interleaver sequence as defined in 5.4.2.2"""
         return self._out_int_inv
 
-    # Add property for rv
     @property
     def rv(self):
         """Redundancy version for rate matching."""
@@ -235,25 +243,26 @@ class LDPC5GEncoder(Block):
         combined with higher order modulation.
         """
         # allow float inputs, but verify that they represent integer
-        if n % 1 != 0:
+        if n%1!=0:
             raise ValueError("n must be int.")
-        if num_bits_per_symbol % 1 != 0:
+        if num_bits_per_symbol%1!=0:
             raise ValueError("num_bits_per_symbol must be int.")
         n = int(n)
-        if n <= 0:
+        if n<=0:
             raise ValueError("n must be a positive integer.")
-        if num_bits_per_symbol <= 0:
+        if num_bits_per_symbol<=0:
             raise ValueError("num_bits_per_symbol must be a positive integer.")
         num_bits_per_symbol = int(num_bits_per_symbol)
 
-        if n % num_bits_per_symbol != 0:
+        if n%num_bits_per_symbol!=0:
             raise ValueError("n must be a multiple of num_bits_per_symbol.")
 
         # pattern as defined in Sec 5.4.2.2
         perm_seq = np.zeros(n, dtype=int)
-        for j in range(int(n / num_bits_per_symbol)):
+        for j in range(int(n/num_bits_per_symbol)):
             for i in range(num_bits_per_symbol):
-                perm_seq[i + j * num_bits_per_symbol] = int(i * int(n / num_bits_per_symbol) + j)
+                perm_seq[i + j*num_bits_per_symbol] \
+                    = int(i * int(n/num_bits_per_symbol) + j)
 
         perm_seq_inv = np.argsort(perm_seq)
 
@@ -278,12 +287,12 @@ class LDPC5GEncoder(Block):
             raise ValueError("Basegraph must be bg1, bg2 or None.")
 
         # check for consistency
-        if bg == "bg1" and k > 8448:
+        if bg=="bg1" and k>8448:
             raise ValueError("K is not supported by BG1 (too large).")
 
-        if bg == "bg2" and k > 3840:
-            raise ValueError(f"K is not supported by BG2 (too large) k ={k}.")
-
+        if bg=="bg2" and k>3840:
+            raise ValueError(
+                f"K is not supported by BG2 (too large) k ={k}.")
 
         return bg
 
@@ -301,10 +310,10 @@ class LDPC5GEncoder(Block):
             raise ValueError("i_ls cannot be negative.")
 
         # csv files are taken from 38.212 and dimension is explicitly given
-        if bg == "bg1":
-            bm = np.zeros([46, 68]) - 1  # init matrix with -1 (None positions)
-        elif bg == "bg2":
-            bm = np.zeros([42, 52]) - 1  # init matrix with -1 (None positions)
+        if bg=="bg1":
+            bm = np.zeros([46, 68]) - 1 # init matrix with -1 (None positions)
+        elif bg=="bg2":
+            bm = np.zeros([42, 52]) - 1 # init matrix with -1 (None positions)
         else:
             raise ValueError("Basegraph not supported.")
 
@@ -319,8 +328,8 @@ class LDPC5GEncoder(Block):
             # check for next row index
             if not np.isnan(bg_csv[r, 0]):
                 r_ind = int(bg_csv[r, 0])
-            c_ind = int(bg_csv[r, 1])  # second column in csv is column index
-            value = bg_csv[r, i_ls + 2]  # i_ls entries start at offset 2
+            c_ind = int(bg_csv[r, 1]) # second column in csv is column index
+            value = bg_csv[r, i_ls + 2] # i_ls entries start at offset 2
             bm[r_ind, c_ind] = value
 
         return bm
@@ -329,12 +338,12 @@ class LDPC5GEncoder(Block):
         """Lift basegraph with lifting factor ``z`` and shifted identities as
         defined by the entries of ``bm``."""
 
-        num_nonzero = np.sum(bm >= 0)  # num of non-neg elements in bm
+        num_nonzero = np.sum(bm>=0) # num of non-neg elements in bm
 
         # init all non-zero row/column indices
-        r_idx = np.zeros(z * num_nonzero)
-        c_idx = np.zeros(z * num_nonzero)
-        data = np.ones(z * num_nonzero)
+        r_idx = np.zeros(z*num_nonzero)
+        c_idx = np.zeros(z*num_nonzero)
+        data = np.ones(z*num_nonzero)
 
         # row/column indices of identity matrix for lifting
         im = np.arange(z)
@@ -342,18 +351,19 @@ class LDPC5GEncoder(Block):
         idx = 0
         for r in range(bm.shape[0]):
             for c in range(bm.shape[1]):
-                if bm[r, c] == -1:  # -1 is used as all-zero matrix placeholder
-                    pass  # do nothing (sparse)
+                if bm[r,c]==-1: # -1 is used as all-zero matrix placeholder
+                    pass #do nothing (sparse)
                 else:
                     # roll matrix by bm[r,c]
-                    c_roll = np.mod(im + bm[r, c], z)
+                    c_roll = np.mod(im+bm[r,c], z)
                     # append rolled identity matrix to pcm
-                    r_idx[idx * z : (idx + 1) * z] = r * z + im
-                    c_idx[idx * z : (idx + 1) * z] = c * z + c_roll
+                    r_idx[idx*z:(idx+1)*z] = r*z + im
+                    c_idx[idx*z:(idx+1)*z] = c*z + c_roll
                     idx += 1
 
         # generate lifted sparse matrix from indices
-        pcm = sp.sparse.csr_matrix((data, (r_idx, c_idx)), shape=(z * bm.shape[0], z * bm.shape[1]))
+        pcm = sp.sparse.csr_matrix((data,(r_idx, c_idx)),
+                                   shape=(z*bm.shape[0], z*bm.shape[1]))
         return pcm
 
     def _sel_lifting(self, k, bg):
@@ -368,16 +378,14 @@ class LDPC5GEncoder(Block):
         k_b is the number of information bit columns in the basegraph.
         """
         # lifting set according to 38.212 Tab 5.3.2-1
-        s_val = [
-            [2, 4, 8, 16, 32, 64, 128, 256],
-            [3, 6, 12, 24, 48, 96, 192, 384],
-            [5, 10, 20, 40, 80, 160, 320],
-            [7, 14, 28, 56, 112, 224],
-            [9, 18, 36, 72, 144, 288],
-            [11, 22, 44, 88, 176, 352],
-            [13, 26, 52, 104, 208],
-            [15, 30, 60, 120, 240],
-        ]
+        s_val = [[2, 4, 8, 16, 32, 64, 128, 256],
+                [3, 6, 12, 24, 48, 96, 192, 384],
+                [5, 10, 20, 40, 80, 160, 320],
+                [7, 14, 28, 56, 112, 224],
+                [9, 18, 36, 72, 144, 288],
+                [11, 22, 44, 88, 176, 352],
+                [13, 26, 52, 104, 208],
+                [15, 30, 60, 120, 240]]
 
         if bg == "bg1":
             k_b = 22
@@ -399,8 +407,8 @@ class LDPC5GEncoder(Block):
         for s in s_val:
             i += 1
             for s1 in s:
-                x = k_b * s1
-                if x >= k:
+                x = k_b *s1
+                if  x >= k:
                     # valid solution
                     if x < min_val:
                         min_val = x
@@ -419,13 +427,13 @@ class LDPC5GEncoder(Block):
         """Split the basegraph into multiple sub-matrices such that efficient
         encoding is possible.
         """
-        g = 4  # code property (always fixed for 5G)
-        mb = bm.shape[0]  # number of CN rows in basegraph (BG property)
+        g = 4 # code property (always fixed for 5G)
+        mb = bm.shape[0] # number of CN rows in basegraph (BG property)
 
         bm_a = bm[0:g, 0:k_b]
-        bm_b = bm[0:g, k_b : (k_b + g)]
+        bm_b = bm[0:g, k_b:(k_b+g)]
         bm_c1 = bm[g:mb, 0:k_b]
-        bm_c2 = bm[g:mb, k_b : (k_b + g)]
+        bm_c2 = bm[g:mb, k_b:(k_b+g)]
 
         # H could be sliced immediately (but easier to implement if based on B)
         hm_a = self._lift_basegraph(bm_a, z)
@@ -441,7 +449,7 @@ class LDPC5GEncoder(Block):
         return hm_a, hm_b_inv, hm_c1, hm_c2
 
     def _find_hm_b_inv(self, bm_b, z, bg):
-        """For encoding we need to find the inverse of `hm_b` such that
+        """ For encoding we need to find the inverse of `hm_b` such that
         `hm_b^-1 * hm_b = I`.
 
         Could be done sparse
@@ -481,13 +489,13 @@ class LDPC5GEncoder(Block):
         """
 
         # permutation indices
-        pm_a = int(bm_b[0, 0])
-        if bg == "bg1":
+        pm_a= int(bm_b[0,0])
+        if bg=="bg1":
             pm_b_inv = int(-bm_b[1, 0])
-        else:  # structure of B is slightly different for bg2
+        else: # structure of B is slightly different for bg2
             pm_b_inv = int(-bm_b[2, 0])
 
-        hm_b_inv = np.zeros([4 * z, 4 * z])
+        hm_b_inv = np.zeros([4*z, 4*z])
 
         im = np.eye(z)
 
@@ -497,33 +505,33 @@ class LDPC5GEncoder(Block):
 
         # row 0
         hm_b_inv[0:z, 0:z] = b_inv
-        hm_b_inv[0:z, z : 2 * z] = b_inv
-        hm_b_inv[0:z, 2 * z : 3 * z] = b_inv
-        hm_b_inv[0:z, 3 * z : 4 * z] = b_inv
+        hm_b_inv[0:z, z:2*z] = b_inv
+        hm_b_inv[0:z, 2*z:3*z] = b_inv
+        hm_b_inv[0:z, 3*z:4*z] = b_inv
 
         # row 1
-        hm_b_inv[z : 2 * z, 0:z] = im + ab_inv
-        hm_b_inv[z : 2 * z, z : 2 * z] = ab_inv
-        hm_b_inv[z : 2 * z, 2 * z : 3 * z] = ab_inv
-        hm_b_inv[z : 2 * z, 3 * z : 4 * z] = ab_inv
+        hm_b_inv[z:2*z, 0:z] = im + ab_inv
+        hm_b_inv[z:2*z, z:2*z] = ab_inv
+        hm_b_inv[z:2*z, 2*z:3*z] = ab_inv
+        hm_b_inv[z:2*z, 3*z:4*z] = ab_inv
 
         # row 2
-        if bg == "bg1":
-            hm_b_inv[2 * z : 3 * z, 0:z] = ab_inv
-            hm_b_inv[2 * z : 3 * z, z : 2 * z] = ab_inv
-            hm_b_inv[2 * z : 3 * z, 2 * z : 3 * z] = im + ab_inv
-            hm_b_inv[2 * z : 3 * z, 3 * z : 4 * z] = im + ab_inv
-        else:  # for bg2 the structure is slightly different
-            hm_b_inv[2 * z : 3 * z, 0:z] = im + ab_inv
-            hm_b_inv[2 * z : 3 * z, z : 2 * z] = im + ab_inv
-            hm_b_inv[2 * z : 3 * z, 2 * z : 3 * z] = ab_inv
-            hm_b_inv[2 * z : 3 * z, 3 * z : 4 * z] = ab_inv
+        if bg=="bg1":
+            hm_b_inv[2*z:3*z, 0:z] = ab_inv
+            hm_b_inv[2*z:3*z, z:2*z] = ab_inv
+            hm_b_inv[2*z:3*z, 2*z:3*z] = im + ab_inv
+            hm_b_inv[2*z:3*z, 3*z:4*z] = im + ab_inv
+        else: # for bg2 the structure is slightly different
+            hm_b_inv[2*z:3*z, 0:z] = im + ab_inv
+            hm_b_inv[2*z:3*z, z:2*z] = im + ab_inv
+            hm_b_inv[2*z:3*z, 2*z:3*z] = ab_inv
+            hm_b_inv[2*z:3*z, 3*z:4*z] = ab_inv
 
         # row 3
-        hm_b_inv[3 * z : 4 * z, 0:z] = ab_inv
-        hm_b_inv[3 * z : 4 * z, z : 2 * z] = ab_inv
-        hm_b_inv[3 * z : 4 * z, 2 * z : 3 * z] = ab_inv
-        hm_b_inv[3 * z : 4 * z, 3 * z : 4 * z] = im + ab_inv
+        hm_b_inv[3*z:4*z, 0:z] = ab_inv
+        hm_b_inv[3*z:4*z, z:2*z] = ab_inv
+        hm_b_inv[3*z:4*z, 2*z:3*z] = ab_inv
+        hm_b_inv[3*z:4*z, 3*z:4*z] = im + ab_inv
 
         # return results as sparse matrix
         return sp.sparse.csr_matrix(hm_b_inv)
@@ -594,10 +602,9 @@ class LDPC5GEncoder(Block):
         c_bin = tf.bitwise.bitwise_and(c_uint8, tf.constant(1, tf.uint8))
         c = tf.cast(c_bin, self.rdtype)
 
-        c = tf.expand_dims(c, axis=-1)  # returns nx1 vector
+        c = tf.expand_dims(c, axis=-1) # returns nx1 vector
         return c
 
-    # This is a new method to create the circular buffer
     def _create_circular_buffer(self, c_short):
         """Creates the circular buffer for rate matching according to TS 38.212."""
 
@@ -606,7 +613,7 @@ class LDPC5GEncoder(Block):
         return circular_buffer
 
     # This is a new method to select bits from the circular buffer based on RV
-    def _select_from_circular_buffer(self, circular_buffer):
+    def _select_from_circular_buffer(self, circular_buffer, batch_size):
         """Selects bits from the circular buffer based on RV.
 
         This implements bit selection with different starting positions for
@@ -646,7 +653,7 @@ class LDPC5GEncoder(Block):
             k0 = tf.math.floormod(k0, N_cb)
 
         # k0 is indexed from after the end of the punctured bits (2*Z_c) to the end of the encoded bits, including the filler bits.
-        # But our circular buffer contains the codeword with filler bits removed and in addition to puncturing (shortening) the first 2*Z_c bits.
+        # But our circular buffer contains the codeword with filler bits removed and into addition to puncturing (shortening) the first 2*Z_c bits.
         # So, we need to adjust k0 based on which of the following 3 regions of the punctured(only) codeword it falls within.
         # 1) k0 is before the start of the filler bits, where no adjustment is needed.
         # 2) k0 falls within the filler bits, where we need to adjust it to point to the last bit before the filler.
@@ -658,8 +665,9 @@ class LDPC5GEncoder(Block):
         elif k0 >= self._k_ldpc - 2 * self._z:
             k0 = k0 - (self._k_ldpc - self._k)
 
-        # Create indices with proper wrapping for circular buffer. For very low code rates (i.e. r < 1/3 for bg1 and r < 1/5 for bg2),
-        # n may be larger than the bits in the circular buffer, so we use modulo to handle the wrapping
+        # Create indices with proper wrapping for circular buffer
+        # For very low code rates (< 1/5), n may be larger than the bits in the
+        # circular buffer, so we use modulo to handle the wrapping
         indices = tf.math.floormod(tf.range(k0, k0 + self._n), N_cb)
 
         # Extract bits from circular buffer
@@ -668,9 +676,9 @@ class LDPC5GEncoder(Block):
         return selected_bits
 
     def build(self, input_shape):
-        """ "Build block."""
+        """"Build block."""
         # check if k and input shape match
-        if input_shape[-1] != self._k:
+        if input_shape[-1]!=self._k:
             raise ValueError("Last dimension must be of length k.")
 
     def call(self, bits):
@@ -702,29 +710,29 @@ class LDPC5GEncoder(Block):
                         tf.logical_or(
                             tf.equal(u, tf.constant(0, self.rdtype)),
                             tf.equal(u, tf.constant(1, self.rdtype)),
-                        ),
-                        self.rdtype,
-                    )
-                ),
+                            ),
+                        self.rdtype)),
                 tf.constant(1, self.rdtype),
-                "Input must be binary.",
-            )
+                "Input must be binary.")
             # input datatype consistency should be only evaluated once
             self._check_input = False
 
         batch_size = tf.shape(u)[0]
 
         # add "filler" bits to last positions to match info bit length k_ldpc
-        u_fill = tf.concat([u, tf.zeros([batch_size, self._k_ldpc - self._k], self.rdtype)], axis=1)
+        u_fill = tf.concat([u,
+            tf.zeros([batch_size, self._k_ldpc-self._k], self.rdtype)],axis=1)
 
         # use optimized encoding based on tf.gather
         c = self._encode_fast(u_fill)
 
-        c = tf.reshape(c, [batch_size, self._n_ldpc])  # remove last dim
+        c = tf.reshape(c, [batch_size, self._n_ldpc]) # remove last dim
 
         # remove filler bits at pos (k, k_ldpc)
         c_no_filler1 = tf.slice(c, [0, 0], [batch_size, self._k])
-        c_no_filler2 = tf.slice(c, [0, self._k_ldpc], [batch_size, self._n_ldpc - self._k_ldpc])
+        c_no_filler2 = tf.slice(c,
+                               [0, self._k_ldpc],
+                               [batch_size, self._n_ldpc - self._k_ldpc])
 
         c_no_filler = tf.concat([c_no_filler1, c_no_filler2], 1)
 
@@ -740,7 +748,7 @@ class LDPC5GEncoder(Block):
             circular_buffer = self._create_circular_buffer(c_short)
 
             # Select bits from circular buffer based on RV with wrapping
-            c_short = self._select_from_circular_buffer(circular_buffer)
+            c_short = self._select_from_circular_buffer(circular_buffer, batch_size)
         else:
             # shorten the first 2*Z positions and end after n bits
             # (remaining parity bits can be used for HARQ)
