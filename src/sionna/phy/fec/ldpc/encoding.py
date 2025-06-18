@@ -7,9 +7,10 @@ import tensorflow as tf
 import numpy as np
 import scipy as sp
 from importlib_resources import files, as_file
-from . import codes # pylint: disable=relative-beyond-top-level
-import numbers # to check if n, k are numbers
+from . import codes  # pylint: disable=relative-beyond-top-level
+import numbers  # to check if n, k are numbers
 from sionna.phy import Block
+
 
 class LDPC5GEncoder(Block):
     # pylint: disable=line-too-long
@@ -68,7 +69,7 @@ class LDPC5GEncoder(Block):
                  n,
                  num_bits_per_symbol=None,
                  bg=None,
-                 rv=0,
+		 rv=0,
                  precision=None,
                  **kwargs):
 
